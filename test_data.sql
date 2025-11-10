@@ -2,7 +2,15 @@
 -- FINAL FIX: US Healthcare Mobile App Registration Test Data Generation
 -- Client ID: 100
 -- Target: >95% OVERALL conversion with proper DISTINCT count funnel flow
--- Average completion time: <3 minutes (guest: 30s, full: +10s start, +20s complete)
+-- Average completion time: ~2 minutes (guest: 75s, full: +20s start, +25s complete = 120s total)
+-- Demographic verified time: ~1.8 minutes (110s from start)
+--
+-- TIMING BREAKDOWN:
+-- - Guest registration: 60-90s (avg 75s)
+-- - Full starts: guest_completed + 10-30s (avg +20s) = 95s from start
+-- - Demographic completes: full_started + 15s = 110s from start (1.83 min)
+-- - Full completes: full_started + 25s = 120s from start (2.0 min)
+-- - Gap between demographic and full: 10 seconds
 --
 -- FUNNEL FLOW (based on Java getFunnelStageMetrics):
 -- 1. Phone Verified: COUNT DISTINCT device_id with SMS/VOICE completed (GUEST)
@@ -13,7 +21,6 @@
 --
 -- Each stage % = current / previous (not from total downloads)
 -- Overall conversion = Full Registered / Total Downloads
--- Demographic to Full registered gap: ~5 seconds
 -- =====================================================================================
 
 BEGIN;
@@ -109,7 +116,7 @@ SELECT
     5, 1,
     started_on,
     CASE WHEN will_succeed_phone AND will_succeed_email THEN
-        started_on + INTERVAL '1 second' * (20 + random() * 20)::INTEGER  -- 20-40s for under 3 min total
+        started_on + INTERVAL '1 second' * (60 + random() * 30)::INTEGER  -- 60-90s (avg 75s)
     ELSE NULL END,
     CASE WHEN will_succeed_phone AND will_succeed_email THEN 2 ELSE 1 END,
     platform, reference_id
@@ -295,7 +302,7 @@ SELECT
     ra_guest.platform,
     ra_guest.registration_started_on as guest_started_on,
     ra_guest.registration_completed_on as guest_completed_on,
-    ra_guest.registration_completed_on + INTERVAL '1 second' * (5 + random() * 10)::INTEGER as full_started_on,  -- 5-15s after guest
+    ra_guest.registration_completed_on + INTERVAL '1 second' * (10 + random() * 20)::INTEGER as full_started_on,  -- 10-30s after guest (avg 20s)
     -- 99% COMPLETED (to achieve 95%+ overall: 0.99 * 0.99 * 0.99 * 0.99 = 96.1%)
     CASE
         WHEN random() < 0.99 THEN 2  -- 99% COMPLETED
@@ -324,8 +331,8 @@ SELECT
     generate_session_id(), 100, user_email, device_id, device_info, ip_address,
     'US', user_phone, 4, 1,
     full_started_on,
-    -- Full completes ~20s after start (demographic completes at +15s, full at +20s = 5s gap)
-    CASE WHEN final_status = 2 THEN full_started_on + INTERVAL '20 seconds' ELSE NULL END,
+    -- Full completes ~25s after start (demographic completes at +15s, full at +25s = 10s gap)
+    CASE WHEN final_status = 2 THEN full_started_on + INTERVAL '25 seconds' ELSE NULL END,
     final_status,
     platform,
     floor(random() * 1000000)::BIGINT
@@ -365,7 +372,7 @@ INSERT INTO guest.verification_attempt (
 SELECT
     ra.id, 100, 4, 'DOC_' || ra.id || '_4', 'VER', 2,
     ra.registration_started_on + INTERVAL '16 seconds',  -- Retry starts right after first attempt
-    CASE WHEN random() < 0.95 THEN ra.registration_started_on + INTERVAL '19 seconds' ELSE NULL END,  -- Completes before full registration
+    CASE WHEN random() < 0.95 THEN ra.registration_started_on + INTERVAL '23 seconds' ELSE NULL END,  -- Completes well before full registration (at +25s)
     NULL,
     CASE WHEN random() < 0.95 THEN 2 ELSE 5 END,
     false, false, false
