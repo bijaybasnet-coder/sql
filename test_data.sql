@@ -77,7 +77,7 @@ $$ LANGUAGE plpgsql;
 
 -- =====================================================================================
 -- STEP 1: GUEST REGISTRATION ATTEMPTS
--- Target: 10000 total downloads, 99% will complete phone+email for 95%+ overall
+-- Target: 3000 total downloads, 99% will complete phone+email for 95%+ overall
 -- =====================================================================================
 
 CREATE TEMP TABLE temp_guest_registrations AS
@@ -95,7 +95,7 @@ SELECT
     CASE WHEN random() < 0.99 THEN true ELSE false END as will_succeed_email,
     CASE WHEN random() < 0.65 THEN 'iOS' ELSE 'Android' END as platform,
     floor(random() * 1000000)::BIGINT as reference_id
-FROM generate_series(1, 10000) AS i;
+FROM generate_series(1, 3000) AS i;
 
 INSERT INTO guest.registration_attempt (
     session_id, client_id, user_email, device_id, device_info, ip_address,
