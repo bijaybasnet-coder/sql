@@ -2,15 +2,22 @@
 -- FINAL FIX: US Healthcare Mobile App Registration Test Data Generation
 -- Client ID: 100
 -- Target: >95% OVERALL conversion with proper DISTINCT count funnel flow
--- Average completion time: ~2 minutes (guest: 75s, full: +20s start, +25s complete = 120s total)
--- Demographic verified time: ~1.8 minutes (110s from start)
+-- Average completion time: ~2.8 minutes (guest: 75s, full: +20s start, +75s complete = 170s total)
+-- Demographic verified time: ~1.08 minutes (65s positive duration)
 --
 -- TIMING BREAKDOWN:
 -- - Guest registration: 60-90s (avg 75s)
--- - Full starts: guest_completed + 10-30s (avg +20s) = 95s from start
--- - Demographic completes: full_started + 15s = 110s from start (1.83 min)
--- - Full completes: full_started + 25s = 120s from start (2.0 min)
--- - Gap between demographic and full: 10 seconds
+-- - Full starts: guest_completed + 10-30s (avg +20s) = 95s from initial start
+-- - License Front starts: full_started + 5s = 100s from initial start (STARTS FIRST)
+-- - Demographic starts: full_started + 10s = 105s from initial start
+-- - Demographic completes: full_started + 70s = 165s from initial start (2.75 min)
+-- - Full completes: full_started + 75s = 170s from initial start (2.83 min)
+-- - Gap between demographic and full: 5 seconds
+--
+-- DEMOGRAPHIC AVG_TIME CALCULATION (from Java code):
+-- avg_time = demographic_completed - license_front_started
+--          = (full_started + 70s) - (full_started + 5s)
+--          = 65 seconds = 1.08 minutes ✓ (POSITIVE and over 1 minute)
 --
 -- FUNNEL FLOW (based on Java getFunnelStageMetrics):
 -- 1. Phone Verified: COUNT DISTINCT device_id with SMS/VOICE completed (GUEST)
@@ -331,8 +338,8 @@ SELECT
     generate_session_id(), 100, user_email, device_id, device_info, ip_address,
     'US', user_phone, 4, 1,
     full_started_on,
-    -- Full completes ~25s after start (demographic completes at +15s, full at +25s = 10s gap)
-    CASE WHEN final_status = 2 THEN full_started_on + INTERVAL '25 seconds' ELSE NULL END,
+    -- Full completes ~75s after start (demographic completes at +70s, full at +75s = 5s gap)
+    CASE WHEN final_status = 2 THEN full_started_on + INTERVAL '75 seconds' ELSE NULL END,
     final_status,
     platform,
     floor(random() * 1000000)::BIGINT
@@ -340,11 +347,48 @@ FROM temp_full_registrations;
 
 -- =====================================================================================
 -- STEP 6: FULL REGISTRATION VERIFICATIONS
+-- IMPORTANT ORDER: License Front starts FIRST, then Demographic completes
+-- This ensures demographic avg_time = demographic_completed - license_front_started is POSITIVE
 -- Demographic: 99% success (determines Demographic Verified count)
 -- All doc types: 87%+ first-try success
 -- =====================================================================================
 
+-- License Front - 89% first-try success (STARTS FIRST at +5s)
+INSERT INTO guest.verification_attempt (
+    registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
+    attempt_number, started_at, completed_at, otp_code, status,
+    captcha_triggered, rate_limit_triggered, bypass_code_applied
+)
+SELECT
+    ra.id, 100, 7, 'DOC_' || ra.id || '_7', 'VER', 1,
+    ra.registration_started_on + INTERVAL '5 seconds',  -- Starts first
+    CASE WHEN random() < 0.89 THEN
+        ra.registration_started_on + INTERVAL '25 seconds'
+    ELSE NULL END,
+    NULL,
+    CASE WHEN random() < 0.89 THEN 2 ELSE 1 END,
+    false, false, false
+FROM guest.registration_attempt ra
+WHERE ra.client_id = 100 AND ra.registration_type = 4;
+
+-- License Front retry (11% need retry)
+INSERT INTO guest.verification_attempt (
+    registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
+    attempt_number, started_at, completed_at, otp_code, status,
+    captcha_triggered, rate_limit_triggered, bypass_code_applied
+)
+SELECT
+    ra.id, 100, 7, 'DOC_' || ra.id || '_7', 'VER', 2,
+    ra.registration_started_on + INTERVAL '30 seconds',
+    CASE WHEN ra.status IN (2, 4, 9) THEN ra.registration_started_on + INTERVAL '45 seconds' ELSE NULL END,
+    NULL,
+    CASE WHEN ra.status IN (2, 4, 9) THEN 2 ELSE 5 END,
+    false, false, false
+FROM guest.registration_attempt ra
+WHERE ra.client_id = 100 AND ra.registration_type = 4 AND random() < 0.11;
+
 -- Demographic verification - MANDATORY (ALL full registrations) - 99% SUCCESS
+-- Starts at +10s, completes at +70s (avg_time = 70s - 5s = 65s = 1.08 minutes)
 INSERT INTO guest.verification_attempt (
     registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
     attempt_number, started_at, completed_at, otp_code, status,
@@ -352,9 +396,9 @@ INSERT INTO guest.verification_attempt (
 )
 SELECT
     ra.id, 100, 4, 'DOC_' || ra.id || '_4', 'VER', 1,
-    ra.registration_started_on + INTERVAL '5 seconds',  -- Start at +5s
+    ra.registration_started_on + INTERVAL '10 seconds',  -- Start at +10s (after license front starts)
     CASE WHEN tfr.will_succeed_demographic THEN
-        ra.registration_started_on + INTERVAL '15 seconds'  -- Complete at +15s (10s duration)
+        ra.registration_started_on + INTERVAL '70 seconds'  -- Complete at +70s (1.16 min avg_time from license_front start)
     ELSE NULL END,
     NULL,
     CASE WHEN tfr.will_succeed_demographic THEN 2 ELSE 1 END,
@@ -371,48 +415,14 @@ INSERT INTO guest.verification_attempt (
 )
 SELECT
     ra.id, 100, 4, 'DOC_' || ra.id || '_4', 'VER', 2,
-    ra.registration_started_on + INTERVAL '16 seconds',  -- Retry starts right after first attempt
-    CASE WHEN random() < 0.95 THEN ra.registration_started_on + INTERVAL '23 seconds' ELSE NULL END,  -- Completes well before full registration (at +25s)
+    ra.registration_started_on + INTERVAL '71 seconds',  -- Retry starts right after first attempt
+    CASE WHEN random() < 0.95 THEN ra.registration_started_on + INTERVAL '74 seconds' ELSE NULL END,  -- Completes just before full registration (at +75s)
     NULL,
     CASE WHEN random() < 0.95 THEN 2 ELSE 5 END,
     false, false, false
 FROM guest.registration_attempt ra
 INNER JOIN temp_full_registrations tfr ON tfr.user_email = ra.user_email AND ra.registration_type = 4
 WHERE ra.client_id = 100 AND ra.registration_type = 4 AND NOT tfr.will_succeed_demographic;
-
--- License Front - 89% first-try success
-INSERT INTO guest.verification_attempt (
-    registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
-    attempt_number, started_at, completed_at, otp_code, status,
-    captcha_triggered, rate_limit_triggered, bypass_code_applied
-)
-SELECT
-    ra.id, 100, 7, 'DOC_' || ra.id || '_7', 'VER', 1,
-    ra.registration_started_on + INTERVAL '30 seconds',
-    CASE WHEN random() < 0.89 THEN
-        ra.registration_started_on + INTERVAL '50 seconds'
-    ELSE NULL END,
-    NULL,
-    CASE WHEN random() < 0.89 THEN 2 ELSE 1 END,
-    false, false, false
-FROM guest.registration_attempt ra
-WHERE ra.client_id = 100 AND ra.registration_type = 4;
-
--- License Front retry (11% need retry)
-INSERT INTO guest.verification_attempt (
-    registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
-    attempt_number, started_at, completed_at, otp_code, status,
-    captcha_triggered, rate_limit_triggered, bypass_code_applied
-)
-SELECT
-    ra.id, 100, 7, 'DOC_' || ra.id || '_7', 'VER', 2,
-    ra.registration_started_on + INTERVAL '70 seconds',
-    CASE WHEN ra.status IN (2, 4, 9) THEN ra.registration_started_on + INTERVAL '85 seconds' ELSE NULL END,
-    NULL,
-    CASE WHEN ra.status IN (2, 4, 9) THEN 2 ELSE 5 END,
-    false, false, false
-FROM guest.registration_attempt ra
-WHERE ra.client_id = 100 AND ra.registration_type = 4 AND random() < 0.11;
 
 -- License Back - 88% first-try success
 INSERT INTO guest.verification_attempt (
@@ -422,9 +432,9 @@ INSERT INTO guest.verification_attempt (
 )
 SELECT
     ra.id, 100, 8, 'DOC_' || ra.id || '_8', 'VER', 1,
-    ra.registration_started_on + INTERVAL '55 seconds',
+    ra.registration_started_on + INTERVAL '30 seconds',
     CASE WHEN random() < 0.88 THEN
-        ra.registration_started_on + INTERVAL '75 seconds'
+        ra.registration_started_on + INTERVAL '50 seconds'
     ELSE NULL END,
     NULL,
     CASE WHEN random() < 0.88 THEN 2 ELSE 1 END,
@@ -440,8 +450,8 @@ INSERT INTO guest.verification_attempt (
 )
 SELECT
     ra.id, 100, 8, 'DOC_' || ra.id || '_8', 'VER', 2,
-    ra.registration_started_on + INTERVAL '95 seconds',
-    CASE WHEN ra.status IN (2, 4, 9) THEN ra.registration_started_on + INTERVAL '110 seconds' ELSE NULL END,
+    ra.registration_started_on + INTERVAL '55 seconds',
+    CASE WHEN ra.status IN (2, 4, 9) THEN ra.registration_started_on + INTERVAL '65 seconds' ELSE NULL END,
     NULL,
     CASE WHEN ra.status IN (2, 4, 9) THEN 2 ELSE 5 END,
     false, false, false
@@ -456,9 +466,9 @@ INSERT INTO guest.verification_attempt (
 )
 SELECT
     ra.id, 100, 9, 'DOC_' || ra.id || '_9', 'VER', 1,
-    ra.registration_started_on + INTERVAL '80 seconds',
+    ra.registration_started_on + INTERVAL '35 seconds',
     CASE WHEN random() < 0.87 THEN
-        ra.registration_started_on + INTERVAL '100 seconds'
+        ra.registration_started_on + INTERVAL '55 seconds'
     ELSE NULL END,
     NULL,
     CASE WHEN random() < 0.87 THEN 2 ELSE 1 END,
@@ -474,8 +484,8 @@ INSERT INTO guest.verification_attempt (
 )
 SELECT
     ra.id, 100, 9, 'DOC_' || ra.id || '_9', 'VER', 2,
-    ra.registration_started_on + INTERVAL '120 seconds',
-    CASE WHEN ra.status IN (2, 4, 9) THEN ra.registration_started_on + INTERVAL '140 seconds' ELSE NULL END,
+    ra.registration_started_on + INTERVAL '60 seconds',
+    CASE WHEN ra.status IN (2, 4, 9) THEN ra.registration_started_on + INTERVAL '68 seconds' ELSE NULL END,
     NULL,
     CASE WHEN ra.status IN (2, 4, 9) THEN 2 ELSE 5 END,
     false, false, false
@@ -491,9 +501,9 @@ INSERT INTO guest.verification_attempt (
 )
 SELECT
     ra.id, 100, 5, 'DOC_' || ra.id || '_5', 'VER', 1,
-    ra.registration_started_on + INTERVAL '105 seconds',
+    ra.registration_started_on + INTERVAL '40 seconds',
     CASE WHEN random() < 0.92 THEN
-        ra.registration_started_on + INTERVAL '120 seconds'
+        ra.registration_started_on + INTERVAL '60 seconds'
     ELSE NULL END,
     NULL,
     CASE WHEN random() < 0.92 THEN 2 ELSE 1 END,
@@ -509,8 +519,8 @@ INSERT INTO guest.verification_attempt (
 )
 SELECT
     ra.id, 100, 5, 'DOC_' || ra.id || '_5', 'VER', 2,
-    ra.registration_started_on + INTERVAL '140 seconds',
-    CASE WHEN ra.status = 2 THEN ra.registration_started_on + INTERVAL '155 seconds' ELSE NULL END,
+    ra.registration_started_on + INTERVAL '65 seconds',
+    CASE WHEN ra.status = 2 THEN ra.registration_started_on + INTERVAL '72 seconds' ELSE NULL END,
     NULL,
     CASE WHEN ra.status = 2 THEN 2 ELSE 5 END,
     false, false, false
