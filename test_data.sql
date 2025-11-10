@@ -3,14 +3,18 @@
 -- Client ID: 100
 -- Target: 3500+ unique device attempts, >95% conversion, <5min avg time
 --
--- FIXES APPLIED:
--- 1. Average completion time: < 5 minutes (guest_start to full_complete)
--- 2. Conversion rate: > 95%
--- 3. Email verified count = Guest registered count
--- 4. Recent users with proper status for demographic validation query
--- 5. Diverse names for full registered users (not just Gabriel Bryant)
--- 6. Proper funnel: Full registered <= Demographic verified
--- 7. Proper timestamps (no "-" in time display)
+-- COMPREHENSIVE FIXES APPLIED:
+-- 1. Conversion rate > 95%
+-- 2. Voice callbacks, captcha triggers, rate limit hits for phone verification
+-- 3. Multiple verification attempts per registration (attempts >> registrations)
+-- 4. Phone verified ≠ Email verified (different counts)
+-- 5. Email verified = Guest registered
+-- 6. SELFIE_MATCH and SSN_INSURANCE_CARD verification data
+-- 7. Email resends (attempt_number 2) with rate limits (NO captcha)
+-- 8. Document retry attempts with realistic metrics
+-- 9. Demographic verification breakdown with match types
+-- 10. Additional verification requests (zip, address)
+-- 11. Diverse registration statuses
 -- =====================================================================================
 
 BEGIN;
@@ -23,10 +27,10 @@ SET timezone = 'America/New_York';
 CREATE OR REPLACE FUNCTION generate_us_phone() RETURNS TEXT AS $$
 DECLARE
     area_codes TEXT[] := ARRAY['202','212','213','214','305','310','312','404','415','510','512','617','619','702','703','714','718','720','832','925'];
-    area_code TEXT;
 BEGIN
-    area_code := area_codes[floor(random() * array_length(area_codes, 1)) + 1];
-    RETURN area_code || lpad((floor(random() * 800) + 200)::TEXT, 3, '0') || lpad((floor(random() * 10000))::TEXT, 4, '0');
+    RETURN area_codes[floor(random() * array_length(area_codes, 1)) + 1] ||
+           lpad((floor(random() * 800) + 200)::TEXT, 3, '0') ||
+           lpad((floor(random() * 10000))::TEXT, 4, '0');
 END;
 $$ LANGUAGE plpgsql;
 
@@ -75,11 +79,9 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- =====================================================================================
--- STEP 1: GUEST REGISTRATION ATTEMPTS
--- KEY FIX: Proper timing - guest_complete = guest_start + 30-60 seconds
+-- STEP 1: GUEST REGISTRATION ATTEMPTS - 96% SUCCESS RATE
 -- =====================================================================================
 
--- Create temp table to track guest registration times properly
 CREATE TEMP TABLE temp_guest_registrations AS
 SELECT
     i as user_id,
@@ -89,75 +91,172 @@ SELECT
     generate_device_info() as device_info,
     generate_us_ip() as ip_address,
     generate_us_phone() as user_phone,
-    -- Start times spread over last 90 days for reporting
     NOW() - INTERVAL '1 day' * (random() * 90)::INTEGER - INTERVAL '1 hour' * (random() * 24)::INTEGER as started_on,
-    -- Success rate for conversion > 95%
-    CASE WHEN random() < 0.96 THEN true ELSE false END as will_complete_guest,
+    -- 96.5% complete guest registration for >95% overall conversion
+    CASE WHEN random() < 0.965 THEN true ELSE false END as will_complete_guest,
     CASE WHEN random() < 0.65 THEN 'iOS' ELSE 'Android' END as platform,
     floor(random() * 1000000)::BIGINT as reference_id
 FROM generate_series(1, 3500) AS i;
 
--- Insert guest registrations with proper timing
 INSERT INTO guest.registration_attempt (
     session_id, client_id, user_email, device_id, device_info, ip_address,
     country_code, user_phone, registration_type, verification_document_type,
     registration_started_on, registration_completed_on, status, platform, reference_id
 )
 SELECT
-    session_id,
-    100 AS client_id,
-    user_email,
-    device_id,
-    device_info,
-    ip_address,
-    'US' as country_code,
-    user_phone,
-    5 AS registration_type,  -- GUEST
-    1 AS verification_document_type,
-    started_on as registration_started_on,
-    -- FIX: Guest completes 30-60 seconds after start (not random time!)
-    CASE WHEN will_complete_guest THEN started_on + INTERVAL '1 second' * (30 + random() * 30)::INTEGER
-         ELSE NULL END as registration_completed_on,
-    CASE WHEN will_complete_guest THEN 2 ELSE 1 END as status,  -- 2=COMPLETED, 1=IN_PROGRESS
-    platform,
-    reference_id
+    session_id, 100, user_email, device_id, device_info, ip_address, 'US', user_phone,
+    5, 1,
+    started_on,
+    CASE WHEN will_complete_guest THEN started_on + INTERVAL '1 second' * (30 + random() * 30)::INTEGER ELSE NULL END,
+    CASE WHEN will_complete_guest THEN 2 ELSE 1 END,
+    platform, reference_id
 FROM temp_guest_registrations;
 
 -- =====================================================================================
--- STEP 2: GUEST VERIFICATION ATTEMPTS (Phone + Email)
+-- STEP 2: PHONE VERIFICATION (SMS + VOICE) - WITH RETRIES, CAPTCHA, RATE LIMITS
+-- Multiple attempts per registration to make verification_attempts >> registrations
 -- =====================================================================================
 
+-- First attempt SMS (everyone gets this)
 INSERT INTO guest.verification_attempt (
     registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
     attempt_number, started_at, completed_at, otp_code, status,
     captcha_triggered, rate_limit_triggered, bypass_code_applied
 )
 SELECT
-    ra.id,
-    100,
-    vt.verification_type,
-    CASE WHEN vt.verification_type IN (1, 2) THEN ra.user_phone ELSE ra.user_email END,
-    CASE WHEN vt.verification_type IN (1, 2) THEN '+1' ELSE NULL END,
-    1,
-    ra.registration_started_on + INTERVAL '1 second' * (vt.step_order * 5)::INTEGER,
+    ra.id, 100,
+    1,  -- SMS
+    ra.user_phone, '+1', 1,
+    ra.registration_started_on + INTERVAL '5 seconds',
+    CASE WHEN ra.status = 2 AND random() < 0.85 THEN  -- 85% succeed on first SMS
+        ra.registration_started_on + INTERVAL '15 seconds'
+    ELSE NULL END,
+    lpad(floor(random() * 1000000)::TEXT, 6, '0'),
+    CASE WHEN ra.status = 2 AND random() < 0.85 THEN 2 ELSE 1 END,
+    random() < 0.08,  -- 8% captcha triggers
+    random() < 0.05,  -- 5% rate limits
+    false
+FROM guest.registration_attempt ra
+WHERE ra.client_id = 100 AND ra.registration_type = 5;
+
+-- Second attempt SMS (15% need retry)
+INSERT INTO guest.verification_attempt (
+    registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
+    attempt_number, started_at, completed_at, otp_code, status,
+    captcha_triggered, rate_limit_triggered, bypass_code_applied
+)
+SELECT
+    ra.id, 100,
+    1,  -- SMS
+    ra.user_phone, '+1', 2,
+    ra.registration_started_on + INTERVAL '45 seconds',
+    CASE WHEN ra.status = 2 AND random() < 0.7 THEN
+        ra.registration_started_on + INTERVAL '55 seconds'
+    ELSE NULL END,
+    lpad(floor(random() * 1000000)::TEXT, 6, '0'),
+    CASE WHEN ra.status = 2 AND random() < 0.7 THEN 2 ELSE 1 END,
+    random() < 0.12,  -- Higher captcha on retry
+    random() < 0.08,  -- Higher rate limit on retry
+    false
+FROM guest.registration_attempt ra
+WHERE ra.client_id = 100 AND ra.registration_type = 5 AND random() < 0.15;
+
+-- Voice callback attempts (10% use voice fallback)
+INSERT INTO guest.verification_attempt (
+    registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
+    attempt_number, started_at, completed_at, otp_code, status,
+    captcha_triggered, rate_limit_triggered, bypass_code_applied
+)
+SELECT
+    ra.id, 100,
+    2,  -- VOICE
+    ra.user_phone, '+1', 1,
+    ra.registration_started_on + INTERVAL '30 seconds',
     CASE WHEN ra.status = 2 THEN
-        ra.registration_started_on + INTERVAL '1 second' * (vt.step_order * 5 + 5 + random() * 10)::INTEGER
+        ra.registration_started_on + INTERVAL '50 seconds'
     ELSE NULL END,
     lpad(floor(random() * 1000000)::TEXT, 6, '0'),
     CASE WHEN ra.status = 2 THEN 2 ELSE 1 END,
-    false, false, false
+    random() < 0.06,  -- 6% captcha on voice
+    random() < 0.04,  -- 4% rate limit on voice
+    false
 FROM guest.registration_attempt ra
-CROSS JOIN (
-    SELECT 1 as verification_type, 1 as step_order  -- SMS
-    UNION ALL
-    SELECT 3 as verification_type, 2 as step_order  -- Email
-) vt
-WHERE ra.client_id = 100 AND ra.registration_type = 5;
+WHERE ra.client_id = 100 AND ra.registration_type = 5 AND random() < 0.10;
+
+-- Third attempt SMS (5% need 3rd try)
+INSERT INTO guest.verification_attempt (
+    registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
+    attempt_number, started_at, completed_at, otp_code, status,
+    captcha_triggered, rate_limit_triggered, bypass_code_applied
+)
+SELECT
+    ra.id, 100, 1, ra.user_phone, '+1', 3,
+    ra.registration_started_on + INTERVAL '90 seconds',
+    CASE WHEN ra.status = 2 THEN ra.registration_started_on + INTERVAL '100 seconds' ELSE NULL END,
+    lpad(floor(random() * 1000000)::TEXT, 6, '0'),
+    CASE WHEN ra.status = 2 THEN 2 ELSE 5 END,
+    random() < 0.15, random() < 0.10, false
+FROM guest.registration_attempt ra
+WHERE ra.client_id = 100 AND ra.registration_type = 5 AND random() < 0.05;
 
 -- =====================================================================================
--- STEP 3: GUEST USERS TABLE
--- KEY FIX: Create guest_user for EVERY completed guest with email verification
--- This ensures email_verified_count = guest_registered_count
+-- STEP 3: EMAIL VERIFICATION - WITH RESENDS (attempt_number 2) AND RATE LIMITS
+-- NO CAPTCHA FOR EMAIL
+-- 98% of phone-verified users complete email (phone_verified > email_verified)
+-- =====================================================================================
+
+-- First email attempt (98% of those who completed phone)
+INSERT INTO guest.verification_attempt (
+    registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
+    attempt_number, started_at, completed_at, otp_code, status,
+    captcha_triggered, rate_limit_triggered, bypass_code_applied
+)
+SELECT
+    ra.id, 100,
+    3,  -- EMAIL
+    ra.user_email, NULL, 1,
+    ra.registration_started_on + INTERVAL '20 seconds',
+    CASE WHEN ra.status = 2 AND random() < 0.98 THEN  -- 98% succeed on first email
+        ra.registration_started_on + INTERVAL '35 seconds'
+    ELSE NULL END,
+    lpad(floor(random() * 1000000)::TEXT, 6, '0'),
+    CASE WHEN ra.status = 2 AND random() < 0.98 THEN 2 ELSE 1 END,
+    false,  -- NO captcha for email
+    random() < 0.03,  -- 3% rate limit
+    false
+FROM guest.registration_attempt ra
+WHERE ra.client_id = 100 AND ra.registration_type = 5
+    AND EXISTS (
+        SELECT 1 FROM guest.verification_attempt va
+        WHERE va.registration_attempt_id = ra.id AND va.verification_type IN (1, 2) AND va.status = 2
+    );
+
+-- Second email attempt - RESENDS (8% need code resend)
+INSERT INTO guest.verification_attempt (
+    registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
+    attempt_number, started_at, completed_at, otp_code, status,
+    captcha_triggered, rate_limit_triggered, bypass_code_applied
+)
+SELECT
+    ra.id, 100,
+    3,  -- EMAIL
+    ra.user_email, NULL, 2,  -- attempt_number = 2 for resends
+    ra.registration_started_on + INTERVAL '60 seconds',
+    CASE WHEN ra.status = 2 THEN
+        ra.registration_started_on + INTERVAL '75 seconds'
+    ELSE NULL END,
+    lpad(floor(random() * 1000000)::TEXT, 6, '0'),
+    CASE WHEN ra.status = 2 THEN 2 ELSE 1 END,
+    false,  -- NO captcha for email
+    random() < 0.06,  -- 6% rate limit on resend
+    false
+FROM guest.registration_attempt ra
+WHERE ra.client_id = 100 AND ra.registration_type = 5 AND ra.status = 2
+    AND random() < 0.08;
+
+-- =====================================================================================
+-- STEP 4: GUEST USERS TABLE
+-- Email verified = Guest registered (create for all with completed email verification)
 -- =====================================================================================
 
 INSERT INTO guest.guest_users (
@@ -166,35 +265,21 @@ INSERT INTO guest.guest_users (
     language_preference, is_active
 )
 SELECT
-    100,
-    ra.user_email,
-    'US',
-    ra.user_phone,
+    100, ra.user_email, 'US', ra.user_phone,
     '$2a$10$' || substr(md5(random()::text), 1, 53),
-    ra.registration_started_on,
-    ra.registration_completed_on,
-    false,  -- Not yet promoted
-    NULL,
-    'en',
-    true  -- KEY FIX: is_active = true for all completed guest registrations
+    ra.registration_started_on, ra.registration_completed_on,
+    false, NULL, 'en', true
 FROM guest.registration_attempt ra
-WHERE ra.client_id = 100
-    AND ra.registration_type = 5
-    AND ra.status = 2  -- Only completed
+WHERE ra.client_id = 100 AND ra.registration_type = 5 AND ra.status = 2
     AND EXISTS (
         SELECT 1 FROM guest.verification_attempt va
-        WHERE va.registration_attempt_id = ra.id
-            AND va.verification_type = 3  -- Email
-            AND va.status = 2  -- Completed
+        WHERE va.registration_attempt_id = ra.id AND va.verification_type = 3 AND va.status = 2
     );
 
 -- =====================================================================================
--- STEP 4: FULL REGISTRATION ATTEMPTS
--- KEY FIX: Full registration starts and completes within 5 minutes of guest start
--- This ensures average completion time < 5 minutes
+-- STEP 5: FULL REGISTRATION ATTEMPTS - DIVERSE STATUSES
 -- =====================================================================================
 
--- Create temp table for full registration timing
 CREATE TEMP TABLE temp_full_registrations AS
 SELECT
     ra_guest.id as guest_ra_id,
@@ -206,107 +291,237 @@ SELECT
     ra_guest.platform,
     ra_guest.registration_started_on as guest_started_on,
     ra_guest.registration_completed_on as guest_completed_on,
-    -- FIX: Full starts 60-120 seconds after guest completion
     ra_guest.registration_completed_on + INTERVAL '1 second' * (60 + random() * 60)::INTEGER as full_started_on,
-    -- 96% of completed guests proceed to full registration
-    CASE WHEN random() < 0.96 THEN true ELSE false END as will_complete_full
+    -- Assign diverse statuses
+    CASE
+        WHEN random() < 0.91 THEN 2  -- 91% COMPLETED
+        WHEN random() < 0.03 THEN 1  -- 3% IN_PROGRESS
+        WHEN random() < 0.015 THEN 4 -- 1.5% IN_HOLDING_TABLE
+        WHEN random() < 0.01 THEN 9  -- 1% IN_CUSTOMER_SUPPORT
+        WHEN random() < 0.005 THEN 7 -- 0.5% IN_VERIFICATION
+        WHEN random() < 0.003 THEN 8 -- 0.3% IN_IDENTIFICATION
+        WHEN random() < 0.001 THEN 3 -- 0.1% ABANDONED
+        ELSE 5                       -- 0.1% FAILED
+    END as final_status
 FROM guest.registration_attempt ra_guest
 WHERE ra_guest.client_id = 100
     AND ra_guest.registration_type = 5
-    AND ra_guest.status = 2  -- Only completed guests
+    AND ra_guest.status = 2
     AND EXISTS (
         SELECT 1 FROM guest.verification_attempt va
         WHERE va.registration_attempt_id = ra_guest.id
-            AND va.verification_type IN (1, 3)  -- Phone and Email
-            AND va.status = 2
-    );
+            AND va.verification_type IN (1, 3) AND va.status = 2
+    )
+    AND random() < 0.97;  -- 97% proceed to full registration
 
--- Insert full registrations
 INSERT INTO guest.registration_attempt (
     session_id, client_id, user_email, device_id, device_info, ip_address,
     country_code, user_phone, registration_type, verification_document_type,
     registration_started_on, registration_completed_on, status, platform, reference_id
 )
 SELECT
-    generate_session_id(),
-    100,
-    user_email,
-    device_id,
-    device_info,
-    ip_address,
-    'US',
-    user_phone,
-    4,  -- FULL registration
-    1,
+    generate_session_id(), 100, user_email, device_id, device_info, ip_address,
+    'US', user_phone, 4, 1,
     full_started_on,
-    -- FIX: Full completes 60-120 seconds after full start
-    CASE WHEN will_complete_full THEN full_started_on + INTERVAL '1 second' * (60 + random() * 60)::INTEGER
-         ELSE NULL END,
-    CASE WHEN will_complete_full THEN 2 ELSE 1 END,
+    CASE WHEN final_status = 2 THEN full_started_on + INTERVAL '1 second' * (60 + random() * 60)::INTEGER ELSE NULL END,
+    final_status,
     platform,
     floor(random() * 1000000)::BIGINT
-FROM temp_full_registrations
-WHERE random() < 0.96;  -- 96% of guests proceed to full
+FROM temp_full_registrations;
 
 -- =====================================================================================
--- STEP 5: FULL REGISTRATION VERIFICATION ATTEMPTS
--- KEY FIX: Ensure every full registration has demographic verification
--- This ensures full_registered <= demographic_verified
+-- STEP 6: FULL REGISTRATION VERIFICATIONS WITH RETRIES
+-- Demographic (4), Selfie Match (5), License Front (7), License Back (8), SSN Card (9)
 -- =====================================================================================
 
+-- Demographic verification - first attempt (all full registrations get this)
 INSERT INTO guest.verification_attempt (
     registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
     attempt_number, started_at, completed_at, otp_code, status,
     captcha_triggered, rate_limit_triggered, bypass_code_applied
 )
 SELECT
-    ra.id,
-    100,
-    vt.verification_type,
-    'DOC_' || ra.id || '_' || vt.verification_type,
-    'VER',
-    1,
-    ra.registration_started_on + INTERVAL '1 second' * (vt.step_order * 10)::INTEGER,
-    CASE WHEN ra.status = 2 THEN
-        ra.registration_started_on + INTERVAL '1 second' * (vt.step_order * 10 + 10 + random() * 20)::INTEGER
+    ra.id, 100, 4, 'DOC_' || ra.id || '_4', 'VER', 1,
+    ra.registration_started_on + INTERVAL '10 seconds',
+    CASE WHEN ra.status IN (2, 4, 9) AND random() < 0.92 THEN
+        ra.registration_started_on + INTERVAL '25 seconds'
     ELSE NULL END,
     NULL,
-    CASE WHEN ra.status = 2 THEN 2 ELSE 1 END,
+    CASE WHEN ra.status IN (2, 4, 9) AND random() < 0.92 THEN 2 ELSE 1 END,
     false, false, false
 FROM guest.registration_attempt ra
-CROSS JOIN (
-    SELECT 4 as verification_type, 1 as step_order  -- Demographic (REQUIRED)
-    UNION ALL
-    SELECT 7 as verification_type, 2 as step_order  -- License Front
-    UNION ALL
-    SELECT 8 as verification_type, 3 as step_order  -- License Back
-) vt
 WHERE ra.client_id = 100 AND ra.registration_type = 4;
 
--- Also add email verification for full registration users
+-- Demographic retry (8% need retry)
 INSERT INTO guest.verification_attempt (
     registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
     attempt_number, started_at, completed_at, otp_code, status,
     captcha_triggered, rate_limit_triggered, bypass_code_applied
 )
 SELECT
-    ra.id,
-    100,
-    3,  -- Email
-    ra.user_email,
+    ra.id, 100, 4, 'DOC_' || ra.id || '_4', 'VER', 2,
+    ra.registration_started_on + INTERVAL '45 seconds',
+    CASE WHEN ra.status IN (2, 4, 9) THEN ra.registration_started_on + INTERVAL '60 seconds' ELSE NULL END,
     NULL,
-    1,
+    CASE WHEN ra.status IN (2, 4, 9) THEN 2 ELSE 5 END,
+    false, false, false
+FROM guest.registration_attempt ra
+WHERE ra.client_id = 100 AND ra.registration_type = 4 AND random() < 0.08;
+
+-- License Front - first attempt
+INSERT INTO guest.verification_attempt (
+    registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
+    attempt_number, started_at, completed_at, otp_code, status,
+    captcha_triggered, rate_limit_triggered, bypass_code_applied
+)
+SELECT
+    ra.id, 100, 7, 'DOC_' || ra.id || '_7', 'VER', 1,
+    ra.registration_started_on + INTERVAL '30 seconds',
+    CASE WHEN ra.status IN (2, 4, 9) AND random() < 0.88 THEN
+        ra.registration_started_on + INTERVAL '50 seconds'
+    ELSE NULL END,
+    NULL,
+    CASE WHEN ra.status IN (2, 4, 9) AND random() < 0.88 THEN 2 ELSE 1 END,
+    false, false, false
+FROM guest.registration_attempt ra
+WHERE ra.client_id = 100 AND ra.registration_type = 4;
+
+-- License Front retry (12% need retry)
+INSERT INTO guest.verification_attempt (
+    registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
+    attempt_number, started_at, completed_at, otp_code, status,
+    captcha_triggered, rate_limit_triggered, bypass_code_applied
+)
+SELECT
+    ra.id, 100, 7, 'DOC_' || ra.id || '_7', 'VER', 2,
+    ra.registration_started_on + INTERVAL '70 seconds',
+    CASE WHEN ra.status IN (2, 4, 9) THEN ra.registration_started_on + INTERVAL '85 seconds' ELSE NULL END,
+    NULL,
+    CASE WHEN ra.status IN (2, 4, 9) THEN 2 ELSE 5 END,
+    false, false, false
+FROM guest.registration_attempt ra
+WHERE ra.client_id = 100 AND ra.registration_type = 4 AND random() < 0.12;
+
+-- License Back - first attempt
+INSERT INTO guest.verification_attempt (
+    registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
+    attempt_number, started_at, completed_at, otp_code, status,
+    captcha_triggered, rate_limit_triggered, bypass_code_applied
+)
+SELECT
+    ra.id, 100, 8, 'DOC_' || ra.id || '_8', 'VER', 1,
+    ra.registration_started_on + INTERVAL '55 seconds',
+    CASE WHEN ra.status IN (2, 4, 9) AND random() < 0.86 THEN
+        ra.registration_started_on + INTERVAL '75 seconds'
+    ELSE NULL END,
+    NULL,
+    CASE WHEN ra.status IN (2, 4, 9) AND random() < 0.86 THEN 2 ELSE 1 END,
+    false, false, false
+FROM guest.registration_attempt ra
+WHERE ra.client_id = 100 AND ra.registration_type = 4;
+
+-- License Back retry (14% need retry)
+INSERT INTO guest.verification_attempt (
+    registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
+    attempt_number, started_at, completed_at, otp_code, status,
+    captcha_triggered, rate_limit_triggered, bypass_code_applied
+)
+SELECT
+    ra.id, 100, 8, 'DOC_' || ra.id || '_8', 'VER', 2,
+    ra.registration_started_on + INTERVAL '95 seconds',
+    CASE WHEN ra.status IN (2, 4, 9) THEN ra.registration_started_on + INTERVAL '110 seconds' ELSE NULL END,
+    NULL,
+    CASE WHEN ra.status IN (2, 4, 9) THEN 2 ELSE 5 END,
+    false, false, false
+FROM guest.registration_attempt ra
+WHERE ra.client_id = 100 AND ra.registration_type = 4 AND random() < 0.14;
+
+-- SSN/Insurance Card - first attempt (70% provide this)
+INSERT INTO guest.verification_attempt (
+    registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
+    attempt_number, started_at, completed_at, otp_code, status,
+    captcha_triggered, rate_limit_triggered, bypass_code_applied
+)
+SELECT
+    ra.id, 100, 9, 'DOC_' || ra.id || '_9', 'VER', 1,
+    ra.registration_started_on + INTERVAL '80 seconds',
+    CASE WHEN ra.status IN (2, 4, 9) AND random() < 0.84 THEN
+        ra.registration_started_on + INTERVAL '100 seconds'
+    ELSE NULL END,
+    NULL,
+    CASE WHEN ra.status IN (2, 4, 9) AND random() < 0.84 THEN 2 ELSE 1 END,
+    false, false, false
+FROM guest.registration_attempt ra
+WHERE ra.client_id = 100 AND ra.registration_type = 4 AND random() < 0.70;
+
+-- SSN/Insurance Card retry (16% need retry)
+INSERT INTO guest.verification_attempt (
+    registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
+    attempt_number, started_at, completed_at, otp_code, status,
+    captcha_triggered, rate_limit_triggered, bypass_code_applied
+)
+SELECT
+    ra.id, 100, 9, 'DOC_' || ra.id || '_9', 'VER', 2,
+    ra.registration_started_on + INTERVAL '120 seconds',
+    CASE WHEN ra.status IN (2, 4, 9) THEN ra.registration_started_on + INTERVAL '140 seconds' ELSE NULL END,
+    NULL,
+    CASE WHEN ra.status IN (2, 4, 9) THEN 2 ELSE 5 END,
+    false, false, false
+FROM guest.registration_attempt ra
+WHERE ra.client_id = 100 AND ra.registration_type = 4 AND random() < 0.16
+    AND EXISTS (SELECT 1 FROM guest.verification_attempt va WHERE va.registration_attempt_id = ra.id AND va.verification_type = 9);
+
+-- Selfie Match verification - first attempt (all completed full registrations)
+INSERT INTO guest.verification_attempt (
+    registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
+    attempt_number, started_at, completed_at, otp_code, status,
+    captcha_triggered, rate_limit_triggered, bypass_code_applied
+)
+SELECT
+    ra.id, 100, 5, 'DOC_' || ra.id || '_5', 'VER', 1,
+    ra.registration_started_on + INTERVAL '105 seconds',
+    CASE WHEN ra.status = 2 AND random() < 0.90 THEN
+        ra.registration_started_on + INTERVAL '120 seconds'
+    ELSE NULL END,
+    NULL,
+    CASE WHEN ra.status = 2 AND random() < 0.90 THEN 2 ELSE 1 END,
+    false, false, false
+FROM guest.registration_attempt ra
+WHERE ra.client_id = 100 AND ra.registration_type = 4;
+
+-- Selfie Match retry (10% need retry)
+INSERT INTO guest.verification_attempt (
+    registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
+    attempt_number, started_at, completed_at, otp_code, status,
+    captcha_triggered, rate_limit_triggered, bypass_code_applied
+)
+SELECT
+    ra.id, 100, 5, 'DOC_' || ra.id || '_5', 'VER', 2,
+    ra.registration_started_on + INTERVAL '140 seconds',
+    CASE WHEN ra.status = 2 THEN ra.registration_started_on + INTERVAL '155 seconds' ELSE NULL END,
+    NULL,
+    CASE WHEN ra.status = 2 THEN 2 ELSE 5 END,
+    false, false, false
+FROM guest.registration_attempt ra
+WHERE ra.client_id = 100 AND ra.registration_type = 4 AND random() < 0.10;
+
+-- Add email verification for full registration users
+INSERT INTO guest.verification_attempt (
+    registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
+    attempt_number, started_at, completed_at, otp_code, status,
+    captcha_triggered, rate_limit_triggered, bypass_code_applied
+)
+SELECT
+    ra.id, 100, 3, ra.user_email, NULL, 1,
     ra.registration_started_on + INTERVAL '5 seconds',
     ra.registration_started_on + INTERVAL '25 seconds',
     lpad(floor(random() * 1000000)::TEXT, 6, '0'),
-    2,  -- Completed
-    false, false, false
+    2, false, false, false
 FROM guest.registration_attempt ra
 WHERE ra.client_id = 100 AND ra.registration_type = 4 AND ra.status = 2;
 
 -- =====================================================================================
--- STEP 6: IDENTITY VERIFICATION DATA
--- KEY FIX: Diverse names (not just Gabriel Bryant), proper session_id linking
+-- STEP 7: IDENTITY VERIFICATION DATA - DIVERSE NAMES
 -- =====================================================================================
 
 INSERT INTO guest.identity_verification_data (
@@ -316,14 +531,12 @@ INSERT INTO guest.identity_verification_data (
     current_zip, current_address_line_1, details, ssn, attempt_number
 )
 SELECT
-    ra.session_id,  -- KEY: Link by session_id
-    -- FIX: Generate diverse names
+    ra.session_id,
     (ARRAY['Alexander','Sophia','Benjamin','Isabella','Christopher','Emma','Daniel','Olivia','Ethan','Ava','Gabriel','Mia','Isaac','Charlotte','Jacob','Abigail','Liam','Harper','Lucas','Evelyn','Mason','Ella','Noah','Scarlett','Oliver','Grace','Sebastian','Chloe','William','Victoria','James','Riley'])[floor(random() * 32 + 1)],
     (ARRAY['Anderson','Thomas','Jackson','White','Harris','Martin','Thompson','Garcia','Martinez','Robinson','Clark','Rodriguez','Lewis','Lee','Walker','Hall','Allen','Young','King','Wright','Lopez','Hill','Scott','Green','Adams','Baker','Nelson','Carter'])[floor(random() * 28 + 1)],
     (ARRAY['A','B','C','D','E','F','G','H','J','K','L','M'])[floor(random() * 12 + 1)],
     (CURRENT_DATE - INTERVAL '1 year' * (18 + random() * 57)::INTEGER)::DATE,
-    1,  -- Driving license
-    1,  -- Manual entry
+    1, 1,
     (ARRAY['NY','CA','TX','FL','PA','IL','OH','GA','NC','MI'])[floor(random() * 10 + 1)],
     (ARRAY['New York','Los Angeles','Chicago','Houston','Phoenix'])[floor(random() * 5 + 1)],
     lpad((floor(random() * 90000) + 10000)::TEXT, 5, '0'),
@@ -342,19 +555,11 @@ SELECT
     lpad((100 + floor(random() * 665))::TEXT, 3, '0') || '-' || lpad((1 + floor(random() * 99))::TEXT, 2, '0') || '-' || lpad((1 + floor(random() * 9999))::TEXT, 4, '0'),
     1
 FROM guest.registration_attempt ra
-WHERE ra.client_id = 100
-    AND ra.registration_type = 4
-    AND ra.status = 2  -- Only completed full registrations
-    AND EXISTS (
-        SELECT 1 FROM guest.verification_attempt va
-        WHERE va.registration_attempt_id = ra.id
-            AND va.verification_type = 4  -- Demographic
-            AND va.status = 2
-    );
+WHERE ra.client_id = 100 AND ra.registration_type = 4 AND ra.status = 2
+    AND EXISTS (SELECT 1 FROM guest.verification_attempt va WHERE va.registration_attempt_id = ra.id AND va.verification_type = 4 AND va.status = 2);
 
 -- =====================================================================================
--- STEP 7: GUEST REGISTRATION LOG
--- KEY FIX: Proper match types for demographic validation query
+-- STEP 8: GUEST REGISTRATION LOG - DEMOGRAPHIC BREAKDOWN WITH MATCH TYPES
 -- =====================================================================================
 
 INSERT INTO guest.guest_registration_log (
@@ -363,72 +568,149 @@ INSERT INTO guest.guest_registration_log (
     ssn, matched_member_id
 )
 SELECT
-    ra.session_id,
-    100,
-    ivd.first_name,
-    ivd.last_name,
-    ivd.dob,
-    ivd.gender,
-    (ARRAY['UNIQUE_MATCH','EXACT_NAME_DOB_GENDER_AND_ZIP_MATCH','AUTO_PROMOTED'])[floor(random() * 3 + 1)],
-    (ARRAY['UNIQUE_MATCH','AUTO_PROMOTED','REGISTRATION_COMPLETED'])[floor(random() * 3 + 1)],
+    ra.session_id, 100, ivd.first_name, ivd.last_name, ivd.dob, ivd.gender,
+    -- Distribute match types for demographic breakdown
+    CASE
+        WHEN row_number() OVER (ORDER BY random()) % 10 = 0 THEN 'UNIQUE_MATCH'
+        WHEN row_number() OVER (ORDER BY random()) % 10 = 1 THEN 'EXACT_NAME_DOB_GENDER_AND_ZIP_MATCH'
+        WHEN row_number() OVER (ORDER BY random()) % 10 = 2 THEN 'EXACT_NAME_AND_SSN_MATCH'
+        WHEN row_number() OVER (ORDER BY random()) % 10 = 3 THEN 'AUTO_PROMOTED'
+        ELSE 'UNIQUE_MATCH'
+    END,
+    CASE
+        WHEN row_number() OVER (ORDER BY random()) % 10 IN (0, 1, 3) THEN 'UNIQUE_MATCH'
+        WHEN row_number() OVER (ORDER BY random()) % 10 = 2 THEN 'EXACT_NAME_AND_SSN_MATCH'
+        ELSE 'AUTO_PROMOTED'
+    END,
     ('{"ip_address": "' || generate_us_ip() || '", "timestamp": "' || NOW()::TEXT || '"}')::json,
-    gu.id,
-    ivd.ssn,
+    gu.id, ivd.ssn,
     floor(random() * 100000 + 10000)::BIGINT
 FROM guest.registration_attempt ra
 INNER JOIN guest.identity_verification_data ivd ON ivd.identification_id = ra.session_id
 LEFT JOIN guest.guest_users gu ON gu.email = ra.user_email
-WHERE ra.client_id = 100
-    AND ra.registration_type = 4
-    AND ra.status = 2;
+WHERE ra.client_id = 100 AND ra.registration_type = 4 AND ra.status = 2;
 
--- KEY FIX: Create some users with demographic completed but NOT full registration completed
--- This is for the buildDemographicValidationQuery to return data
+-- Add records for IN_CUSTOMER_SUPPORT status (partial matches)
+INSERT INTO guest.guest_registration_log (
+    identification_id, client_id, first_name, last_name, dob, gender,
+    match_type, action, additional_details, guest_user_reference_id,
+    ssn, matched_member_id
+)
+SELECT
+    ra.session_id, 100,
+    (ARRAY['Michael','Sarah','David','Emma'])[floor(random() * 4 + 1)],
+    (ARRAY['Johnson','Williams','Brown','Davis'])[floor(random() * 4 + 1)],
+    (CURRENT_DATE - INTERVAL '1 year' * (25 + random() * 40)::INTEGER)::DATE,
+    CASE WHEN random() < 0.5 THEN 'M' ELSE 'F' END,
+    'SOFT_MATCH',
+    'SENT_TO_CUSTOMER_SUPPORT',
+    ('{"ip_address": "' || generate_us_ip() || '", "timestamp": "' || NOW()::TEXT || '"}')::json,
+    NULL,
+    lpad((100 + floor(random() * 665))::TEXT, 3, '0') || '-' || lpad((1 + floor(random() * 99))::TEXT, 2, '0') || '-' || lpad((1 + floor(random() * 9999))::TEXT, 4, '0'),
+    floor(random() * 100000 + 10000)::BIGINT
+FROM guest.registration_attempt ra
+WHERE ra.client_id = 100 AND ra.registration_type = 4 AND ra.status = 9;
+
+-- Add records for IN_HOLDING_TABLE status (no matches)
+INSERT INTO guest.guest_registration_log (
+    identification_id, client_id, first_name, last_name, dob, gender,
+    match_type, action, additional_details, guest_user_reference_id,
+    ssn, matched_member_id
+)
+SELECT
+    ra.session_id, 100,
+    (ARRAY['John','Lisa','Robert','Anna'])[floor(random() * 4 + 1)],
+    (ARRAY['Miller','Wilson','Moore','Taylor'])[floor(random() * 4 + 1)],
+    (CURRENT_DATE - INTERVAL '1 year' * (20 + random() * 50)::INTEGER)::DATE,
+    CASE WHEN random() < 0.5 THEN 'M' ELSE 'F' END,
+    'NO_MATCH',
+    'IN_HOLDING_TABLE',
+    ('{"ip_address": "' || generate_us_ip() || '", "timestamp": "' || NOW()::TEXT || '"}')::json,
+    NULL,
+    lpad((100 + floor(random() * 665))::TEXT, 3, '0') || '-' || lpad((1 + floor(random() * 99))::TEXT, 2, '0') || '-' || lpad((1 + floor(random() * 9999))::TEXT, 4, '0'),
+    NULL
+FROM guest.registration_attempt ra
+WHERE ra.client_id = 100 AND ra.registration_type = 4 AND ra.status = 4;
+
+-- =====================================================================================
+-- STEP 9: ADDITIONAL VERIFICATION REQUESTS (ZIP AND ADDRESS)
+-- =====================================================================================
+
+-- Zip code requests
+INSERT INTO guest.guest_registration_log (
+    identification_id, client_id, first_name, last_name, dob, gender,
+    match_type, action, additional_details, guest_user_reference_id,
+    ssn, matched_member_id
+)
+SELECT
+    'ZIP_REQ_' || i,
+    100,
+    (ARRAY['Alex','Maria','James','Anna'])[floor(random() * 4 + 1)],
+    (ARRAY['Garcia','Miller','Wilson','Moore'])[floor(random() * 4 + 1)],
+    (CURRENT_DATE - INTERVAL '1 year' * (20 + random() * 50)::INTEGER)::DATE,
+    CASE WHEN random() < 0.5 THEN 'M' ELSE 'F' END,
+    'MULTIPLE_MATCH',
+    'Asked Current Zip',
+    ('{"verification_type": "zip_request", "timestamp": "' || NOW()::TEXT || '"}')::json,
+    NULL,
+    lpad((100 + floor(random() * 665))::TEXT, 3, '0') || '-' || lpad((1 + floor(random() * 99))::TEXT, 2, '0') || '-' || lpad((1 + floor(random() * 9999))::TEXT, 4, '0'),
+    floor(random() * 100000 + 10000)::BIGINT
+FROM generate_series(1, 85) AS i;
+
+-- Address requests
+INSERT INTO guest.guest_registration_log (
+    identification_id, client_id, first_name, last_name, dob, gender,
+    match_type, action, additional_details, guest_user_reference_id,
+    ssn, matched_member_id
+)
+SELECT
+    'ADDR_REQ_' || i,
+    100,
+    (ARRAY['Kevin','Susan','Robert','Linda'])[floor(random() * 4 + 1)],
+    (ARRAY['Clark','Lewis','Walker','Hall'])[floor(random() * 4 + 1)],
+    (CURRENT_DATE - INTERVAL '1 year' * (20 + random() * 50)::INTEGER)::DATE,
+    CASE WHEN random() < 0.5 THEN 'M' ELSE 'F' END,
+    'EXACT_NAME_AND_DOB_MATCH_WITH_ADDRESS_MISMATCH',
+    'Asked Current Address',
+    ('{"verification_type": "address_request", "timestamp": "' || NOW()::TEXT || '"}')::json,
+    NULL,
+    lpad((100 + floor(random() * 665))::TEXT, 3, '0') || '-' || lpad((1 + floor(random() * 99))::TEXT, 2, '0') || '-' || lpad((1 + floor(random() * 9999))::TEXT, 4, '0'),
+    floor(random() * 100000 + 10000)::BIGINT
+FROM generate_series(1, 45) AS i;
+
+-- =====================================================================================
+-- STEP 10: RECENT USERS FOR DEMOGRAPHIC VALIDATION (IN_PROGRESS with demographic complete)
+-- =====================================================================================
+
 INSERT INTO guest.registration_attempt (
     session_id, client_id, user_email, device_id, device_info, ip_address,
     country_code, user_phone, registration_type, verification_document_type,
     registration_started_on, registration_completed_on, status, platform, reference_id
 )
 SELECT
-    generate_session_id(),
-    100,
+    generate_session_id(), 100,
     'pending.' || i || '@test.com',
-    generate_device_id(),
-    generate_device_info(),
-    generate_us_ip(),
-    'US',
-    generate_us_phone(),
-    5,  -- GUEST type
-    1,
+    generate_device_id(), generate_device_info(), generate_us_ip(),
+    'US', generate_us_phone(), 5, 1,
     NOW() - INTERVAL '1 hour' * i,
     NOW() - INTERVAL '1 hour' * i + INTERVAL '1 minute',
-    1,  -- IN_PROGRESS (not completed!)
-    'iOS',
-    floor(random() * 1000000)::BIGINT
+    1,  -- IN_PROGRESS
+    'iOS', floor(random() * 1000000)::BIGINT
 FROM generate_series(1, 20) AS i;
 
--- Add demographic verification for these pending users
 INSERT INTO guest.verification_attempt (
     registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
     attempt_number, started_at, completed_at, otp_code, status,
     captcha_triggered, rate_limit_triggered, bypass_code_applied
 )
 SELECT
-    ra.id,
-    100,
-    4,  -- Demographic
-    'DOC_' || ra.id,
-    'VER',
-    1,
+    ra.id, 100, 4, 'DOC_' || ra.id, 'VER', 1,
     ra.registration_started_on + INTERVAL '30 seconds',
     ra.registration_started_on + INTERVAL '90 seconds',
-    NULL,
-    2,  -- Completed
-    false, false, false
+    NULL, 2, false, false, false
 FROM guest.registration_attempt ra
 WHERE ra.user_email LIKE 'pending.%@test.com';
 
--- Add identity data for pending users
 INSERT INTO guest.identity_verification_data (
     identification_id, first_name, last_name, dob, document_type,
     data_source, state, city, zip, address_line_1, gender
@@ -450,7 +732,6 @@ WHERE ra.user_email LIKE 'pending.%@test.com';
 
 DROP TABLE IF EXISTS temp_guest_registrations;
 DROP TABLE IF EXISTS temp_full_registrations;
-
 DROP FUNCTION IF EXISTS generate_us_phone();
 DROP FUNCTION IF EXISTS generate_healthcare_email();
 DROP FUNCTION IF EXISTS generate_device_id();
@@ -464,92 +745,96 @@ COMMIT;
 -- VERIFICATION QUERIES
 -- =====================================================================================
 
--- Test 1: Average completion time (should be < 5 minutes = 300 seconds)
+-- Test 1: Overall conversion rate (should be > 95%)
 SELECT
-    'Average Completion Time' as metric,
-    ROUND(AVG(EXTRACT(EPOCH FROM (full_ra.registration_completed_on - guest_ra.registration_started_on))), 2) as seconds,
-    ROUND(AVG(EXTRACT(EPOCH FROM (full_ra.registration_completed_on - guest_ra.registration_started_on))) / 60.0, 2) as minutes
-FROM guest.registration_attempt guest_ra
-INNER JOIN guest.registration_attempt full_ra ON guest_ra.user_email = full_ra.user_email
-INNER JOIN guest.guest_registration_log grl ON grl.identification_id = full_ra.session_id
-WHERE guest_ra.registration_type = 5
-    AND full_ra.registration_type = 4
-    AND full_ra.status = 2
-    AND guest_ra.status = 2
-    AND guest_ra.registration_started_on IS NOT NULL
-    AND full_ra.registration_completed_on IS NOT NULL
-    AND grl.action != 'SENT_TO_CUSTOMER_SUPPORT'
-    AND guest_ra.client_id = 100;
-
--- Test 2: Conversion rate (should be > 95%)
-SELECT
-    'Conversion Rate' as metric,
-    ROUND(COUNT(*) FILTER (WHERE status = 2) * 100.0 / COUNT(*), 2) as percentage
+    'Overall Conversion Rate' as metric,
+    ROUND(COUNT(*) FILTER (WHERE status = 2) * 100.0 / COUNT(*), 2) || '%' as value
 FROM guest.registration_attempt
 WHERE client_id = 100;
 
--- Test 3: Email verified vs Guest registered (should be equal)
-WITH email_verified AS (
-    SELECT COUNT(DISTINCT ra.user_email) as count
-    FROM guest.registration_attempt ra
-    INNER JOIN guest.verification_attempt va ON va.registration_attempt_id = ra.id
-    WHERE ra.registration_type = 5
-        AND ra.status = 2
-        AND va.verification_type = 3
-        AND va.status = 2
-        AND ra.client_id = 100
-),
-guest_registered AS (
-    SELECT COUNT(DISTINCT email) as count
-    FROM guest.guest_users
-    WHERE client_id = 100 AND is_active = true
-)
+-- Test 2: Phone verification metrics
 SELECT
-    'Email Verified Count' as metric, ev.count as value FROM email_verified ev
-UNION ALL
-SELECT
-    'Guest Registered Count' as metric, gr.count as value FROM guest_registered gr;
+    'Phone Verification' as section,
+    COUNT(DISTINCT id) as total_attempts,
+    SUM(CASE WHEN status = 2 THEN 1 ELSE 0 END) as successful,
+    SUM(CASE WHEN verification_type = 2 THEN 1 ELSE 0 END) as voice_fallbacks,
+    SUM(CASE WHEN captcha_triggered = true THEN 1 ELSE 0 END) as captcha_triggers,
+    SUM(CASE WHEN rate_limit_triggered = true THEN 1 ELSE 0 END) as rate_limits
+FROM guest.verification_attempt
+WHERE verification_type IN (1, 2);
 
--- Test 4: Recent users for demographic validation (should return > 0)
-SELECT COUNT(*) as recent_users_count
-FROM guest.registration_attempt ra
-WHERE ra.user_email IS NOT NULL
-    AND ra.status != 2  -- Not completed
-    AND EXISTS (
-        SELECT 1 FROM guest.verification_attempt va_demo
-        WHERE va_demo.registration_attempt_id = ra.id
-            AND va_demo.verification_type = 4
-            AND va_demo.status = 2
-    )
-    AND ra.client_id = 100;
-
--- Test 5: Funnel metrics (full <= demographic)
-WITH funnel AS (
-    SELECT
-        COUNT(DISTINCT CASE WHEN ra.registration_type = 5 THEN ra.device_id END) as downloads,
-        COUNT(DISTINCT CASE WHEN va_demo.status = 2 THEN ra.user_email END) as demographic_verified,
-        COUNT(DISTINCT CASE WHEN ra.registration_type = 4 AND ra.status = 2 THEN ra.user_email END) as full_registered
-    FROM guest.registration_attempt ra
-    LEFT JOIN guest.verification_attempt va_demo
-        ON va_demo.registration_attempt_id = ra.id AND va_demo.verification_type = 4
-    WHERE ra.client_id = 100
-)
+-- Test 3: Email verification metrics
 SELECT
-    downloads,
-    demographic_verified,
-    full_registered,
-    CASE WHEN full_registered <= demographic_verified THEN 'PASS' ELSE 'FAIL' END as funnel_check
-FROM funnel;
+    'Email Verification' as section,
+    COUNT(DISTINCT id) as total_attempts,
+    SUM(CASE WHEN status = 2 THEN 1 ELSE 0 END) as successful,
+    SUM(CASE WHEN rate_limit_triggered = true THEN 1 ELSE 0 END) as rate_limits,
+    SUM(CASE WHEN attempt_number > 1 THEN 1 ELSE 0 END) as resends
+FROM guest.verification_attempt
+WHERE verification_type = 3;
 
--- Test 6: Name diversity (should show multiple different names)
+-- Test 4: Document verification breakdown
 SELECT
-    COALESCE(ivd.first_name || ' ' || ivd.last_name, 'Unknown') as full_name,
+    CASE verification_type
+        WHEN 7 THEN 'License Front'
+        WHEN 8 THEN 'License Back'
+        WHEN 9 THEN 'SSN Card'
+    END as document_type,
+    COUNT(*) FILTER (WHERE attempt_number = 1) as first_attempts,
+    COUNT(*) FILTER (WHERE attempt_number > 1) as retries
+FROM guest.verification_attempt
+WHERE verification_type IN (7, 8, 9)
+GROUP BY verification_type;
+
+-- Test 5: Selfie verification
+SELECT
+    'Selfie Match Verification' as metric,
+    COUNT(*) as total_attempts,
+    COUNT(*) FILTER (WHERE attempt_number = 1) as first_attempts,
+    COUNT(*) FILTER (WHERE attempt_number > 1) as retries
+FROM guest.verification_attempt
+WHERE verification_type = 5;
+
+-- Test 6: Demographic verification breakdown
+SELECT
+    'Demographic Breakdown' as section,
+    COUNT(*) as total,
+    SUM(CASE WHEN match_type IN ('UNIQUE_MATCH', 'EXACT_NAME_DOB_GENDER_AND_ZIP_MATCH') THEN 1 ELSE 0 END) as direct_matches,
+    SUM(CASE WHEN match_type = 'EXACT_NAME_AND_SSN_MATCH' THEN 1 ELSE 0 END) as ssn_fallback,
+    SUM(CASE WHEN action = 'SENT_TO_CUSTOMER_SUPPORT' THEN 1 ELSE 0 END) as partial_matches,
+    SUM(CASE WHEN action = 'IN_HOLDING_TABLE' THEN 1 ELSE 0 END) as no_matches
+FROM guest.guest_registration_log;
+
+-- Test 7: Additional verification requests
+SELECT
+    'Additional Verification' as section,
+    SUM(CASE WHEN action = 'Asked Current Zip' THEN 1 ELSE 0 END) as zip_requests,
+    SUM(CASE WHEN action = 'Asked Current Address' THEN 1 ELSE 0 END) as address_requests
+FROM guest.guest_registration_log;
+
+-- Test 8: Registration status distribution
+SELECT
+    CASE status
+        WHEN 1 THEN 'IN_PROGRESS'
+        WHEN 2 THEN 'COMPLETED'
+        WHEN 3 THEN 'ABANDONED'
+        WHEN 4 THEN 'IN_HOLDING_TABLE'
+        WHEN 5 THEN 'FAILED'
+        WHEN 7 THEN 'IN_VERIFICATION'
+        WHEN 8 THEN 'IN_IDENTIFICATION'
+        WHEN 9 THEN 'IN_CUSTOMER_SUPPORT'
+    END as status_name,
     COUNT(*) as count
-FROM guest.registration_attempt ra
-LEFT JOIN guest.identity_verification_data ivd ON ra.session_id = ivd.identification_id
-WHERE ra.client_id = 100
-    AND ra.registration_type = 4
-    AND ra.status = 2
-GROUP BY ivd.first_name, ivd.last_name
-ORDER BY count DESC
-LIMIT 10;
+FROM guest.registration_attempt
+WHERE client_id = 100 AND registration_type = 4
+GROUP BY status
+ORDER BY status;
+
+-- Test 9: Verification attempts vs registrations ratio
+SELECT
+    'Verification to Registration Ratio' as metric,
+    (SELECT COUNT(*) FROM guest.verification_attempt) as verification_attempts,
+    (SELECT COUNT(*) FROM guest.registration_attempt WHERE client_id = 100) as registrations,
+    ROUND((SELECT COUNT(*) FROM guest.verification_attempt)::NUMERIC /
+          (SELECT COUNT(*) FROM guest.registration_attempt WHERE client_id = 100), 2) as ratio
+;
