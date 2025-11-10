@@ -2,22 +2,24 @@
 -- FINAL FIX: US Healthcare Mobile App Registration Test Data Generation
 -- Client ID: 100
 -- Target: >95% OVERALL conversion with proper DISTINCT count funnel flow
--- Average completion time: ~2.8 minutes (guest: 75s, full: +20s start, +75s complete = 170s total)
--- Demographic verified time: ~1.08 minutes (65s positive duration)
+-- Average completion time: ~2.1 minutes (guest: 20s, full: +5s start, +100s complete = 125s total)
 --
 -- TIMING BREAKDOWN:
--- - Guest registration: 60-90s (avg 75s)
--- - Full starts: guest_completed + 10-30s (avg +20s) = 95s from initial start
--- - License Front starts: full_started + 5s = 100s from initial start (STARTS FIRST)
--- - Demographic starts: full_started + 10s = 105s from initial start
--- - Demographic completes: full_started + 70s = 165s from initial start (2.75 min)
--- - Full completes: full_started + 75s = 170s from initial start (2.83 min)
+-- - Guest registration: 20s (phone: 15s + email: 5s)
+-- - Full starts: guest_completed + 5s = 25s from initial start
+-- - License Front starts: full_started + 5s = 30s from initial start (STARTS FIRST)
+-- - Demographic starts: full_started + 10s = 35s from initial start
+-- - Demographic completes: full_started + 95s = 120s from initial start (2.0 min)
+-- - Full completes: full_started + 100s = 125s from initial start (2.08 min)
 -- - Gap between demographic and full: 5 seconds
 --
--- DEMOGRAPHIC AVG_TIME CALCULATION (from Java code):
--- avg_time = demographic_completed - license_front_started
---          = (full_started + 70s) - (full_started + 5s)
---          = 65 seconds = 1.08 minutes ✓ (POSITIVE and over 1 minute)
+-- METRIC TIMINGS (from Java calculations):
+-- - Phone Verified avg_time: ~15 seconds
+-- - Email Verified avg_time: ~20 seconds total
+-- - Demographic Verified avg_time: demographic_completed - license_front_started
+--                                 = (full_started + 95s) - (full_started + 5s)
+--                                 = 90 seconds = 1m 30s ✓
+-- - Full Registered avg_time: 5 seconds after demographic
 --
 -- FUNNEL FLOW (based on Java getFunnelStageMetrics):
 -- 1. Phone Verified: COUNT DISTINCT device_id with SMS/VOICE completed (GUEST)
@@ -123,7 +125,7 @@ SELECT
     5, 1,
     started_on,
     CASE WHEN will_succeed_phone AND will_succeed_email THEN
-        started_on + INTERVAL '1 second' * (60 + random() * 30)::INTEGER  -- 60-90s (avg 75s)
+        started_on + INTERVAL '20 seconds'  -- 20s for phone (15s) + email (5s)
     ELSE NULL END,
     CASE WHEN will_succeed_phone AND will_succeed_email THEN 2 ELSE 1 END,
     platform, reference_id
@@ -309,7 +311,7 @@ SELECT
     ra_guest.platform,
     ra_guest.registration_started_on as guest_started_on,
     ra_guest.registration_completed_on as guest_completed_on,
-    ra_guest.registration_completed_on + INTERVAL '1 second' * (10 + random() * 20)::INTEGER as full_started_on,  -- 10-30s after guest (avg 20s)
+    ra_guest.registration_completed_on + INTERVAL '5 seconds' as full_started_on,  -- 5s after guest
     -- 99% COMPLETED (to achieve 95%+ overall: 0.99 * 0.99 * 0.99 * 0.99 = 96.1%)
     CASE
         WHEN random() < 0.99 THEN 2  -- 99% COMPLETED
@@ -338,8 +340,8 @@ SELECT
     generate_session_id(), 100, user_email, device_id, device_info, ip_address,
     'US', user_phone, 4, 1,
     full_started_on,
-    -- Full completes ~75s after start (demographic completes at +70s, full at +75s = 5s gap)
-    CASE WHEN final_status = 2 THEN full_started_on + INTERVAL '75 seconds' ELSE NULL END,
+    -- Full completes 100s after start (demographic at +95s, full at +100s = 5s gap)
+    CASE WHEN final_status = 2 THEN full_started_on + INTERVAL '100 seconds' ELSE NULL END,
     final_status,
     platform,
     floor(random() * 1000000)::BIGINT
@@ -388,7 +390,7 @@ FROM guest.registration_attempt ra
 WHERE ra.client_id = 100 AND ra.registration_type = 4 AND random() < 0.11;
 
 -- Demographic verification - MANDATORY (ALL full registrations) - 99% SUCCESS
--- Starts at +10s, completes at +70s (avg_time = 70s - 5s = 65s = 1.08 minutes)
+-- Starts at +10s, completes at +95s (avg_time = 95s - 5s = 90s = 1m 30s)
 INSERT INTO guest.verification_attempt (
     registration_attempt_id, client_id, verification_type, entity_id, entity_prefix,
     attempt_number, started_at, completed_at, otp_code, status,
@@ -398,7 +400,7 @@ SELECT
     ra.id, 100, 4, 'DOC_' || ra.id || '_4', 'VER', 1,
     ra.registration_started_on + INTERVAL '10 seconds',  -- Start at +10s (after license front starts)
     CASE WHEN tfr.will_succeed_demographic THEN
-        ra.registration_started_on + INTERVAL '70 seconds'  -- Complete at +70s (1.16 min avg_time from license_front start)
+        ra.registration_started_on + INTERVAL '95 seconds'  -- Complete at +95s (90s = 1m 30s from license_front start)
     ELSE NULL END,
     NULL,
     CASE WHEN tfr.will_succeed_demographic THEN 2 ELSE 1 END,
@@ -415,8 +417,8 @@ INSERT INTO guest.verification_attempt (
 )
 SELECT
     ra.id, 100, 4, 'DOC_' || ra.id || '_4', 'VER', 2,
-    ra.registration_started_on + INTERVAL '71 seconds',  -- Retry starts right after first attempt
-    CASE WHEN random() < 0.95 THEN ra.registration_started_on + INTERVAL '74 seconds' ELSE NULL END,  -- Completes just before full registration (at +75s)
+    ra.registration_started_on + INTERVAL '96 seconds',  -- Retry starts right after first attempt
+    CASE WHEN random() < 0.95 THEN ra.registration_started_on + INTERVAL '99 seconds' ELSE NULL END,  -- Completes just before full registration (at +100s)
     NULL,
     CASE WHEN random() < 0.95 THEN 2 ELSE 5 END,
     false, false, false
